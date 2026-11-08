@@ -1,0 +1,87 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "15 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  KEEP: "30"
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check configuration
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          ARCHIVE_REPO: ${{ secrets.ARCHIVE_REPO }}
+        run: |
+          for name in DATABASE_URL BACKUP_PASSPHRASE DEPLOY_KEY ARCHIVE_REPO; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing $name"
+              exit 1
+            fi
+          done
+      - name: Install client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+      - name: Export
+        id: export
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          DATABASE_URL=$(printf '%s' "$DATABASE_URL" | tr -d '\r\n')
+          BACKUP_PASSPHRASE=$(printf '%s' "$BACKUP_PASSPHRASE" | tr -d '\r\n')
+          # Verify the server against the CA in certs/
+          DATABASE_URL=$(python3 -c 'import sys, urllib.parse as u; p = u.urlsplit(sys.argv[1]); q = [(k, v) for k, v in u.parse_qsl(p.query) if k != "sslrootcert"] + [("sslrootcert", sys.argv[2])]; print(u.urlunsplit(p._replace(query=u.urlencode(q))))' "$DATABASE_URL" "$GITHUB_WORKSPACE/certs/ca.crt")
+          export DATABASE_URL BACKUP_PASSPHRASE
+          path=$(PATH="/usr/lib/postgresql/17/bin:$PATH" python3 scripts/export.py --output-dir "$RUNNER_TEMP")
+          printf 'path=%s\n' "$path" >> "$GITHUB_OUTPUT"
+      - name: Store
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          ARCHIVE_REPO: ${{ secrets.ARCHIVE_REPO }}
+          FILE: ${{ steps.export.outputs.path }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/key"
+          printf '%s\n' "$DEPLOY_KEY" > "$key"
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          store="$RUNNER_TEMP/store"
+          git init -q -b main "$store"
+          cd "$store"
+          git remote add origin "$(printf '%s' "$ARCHIVE_REPO" | tr -d '\r\n')"
+          mkdir -p backups
+          if git fetch -q --depth 1 origin main 2>/dev/null; then
+            git checkout -q FETCH_HEAD -- backups
+          fi
+          cp "$FILE" backups/
+          ls backups/*.dump.enc | sort | head -n -"$KEEP" | xargs -r rm --
+          ls backups/*.dump.enc | sort | sed 's#^backups/##' > INDEX.txt
+          git add -A
+          git -c user.name="nightly" -c user.email="nightly@users.noreply.github.com" \
+            commit -q -m "Add ${FILE##*/}"
+          git push -q --force origin HEAD:main
+          echo "Kept $(wc -l < INDEX.txt)"
+          rm -f "$key"
